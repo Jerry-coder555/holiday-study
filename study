@@ -1,0 +1,362 @@
+import cv2                  # OpenCV：读取摄像头、处理图像、显示画面
+import numpy as np          # NumPy：创建形态学处理需要的矩阵
+
+
+# ============================================================
+# 1. 可调参数
+# ============================================================
+
+CAMERA_ID = 0               # 摄像头编号；打不开时可尝试 1
+FRAME_WIDTH = 640           # 处理画面的宽度
+FRAME_HEIGHT = 480          # 处理画面的高度
+
+# ROI：感兴趣区域，只分析画面下方的一条横带。
+# 这里选择高度的 65%～85%，避免整幅画面的背景干扰。
+ROI_TOP_RATIO = 0.65
+ROI_BOTTOM_RATIO = 0.85
+
+INITIAL_THRESHOLD = 90     # 黑线灰度阈值，可在窗口中拖动滑块调整
+MIN_CONTOUR_AREA = 150      # 太小的轮廓当作噪声，单位近似为像素面积
+
+# 以下是教学用的归一化控制值，不是实际 m/s，也不是直接可用的 PWM。
+# 约定 0 表示停止，1 表示允许的最大前进指令。
+BASE_SPEED = 0.30
+MAX_SPEED = 0.60
+
+# 比例控制参数：偏差越大，左右轮速度差越大。
+KP = 0.45
+
+
+# ============================================================
+# 2. 辅助函数
+# ============================================================
+
+def limit(value, lower, upper):
+    """把数值限制在指定范围内，避免控制值过大或过小。"""
+    return max(lower, min(upper, value))
+
+
+def on_threshold_change(value):
+    """滑块要求提供回调函数；本程序在循环中主动读取滑块值。"""
+    pass
+
+
+def set_motor_command(left, right):
+    """
+    电机接口预留位置。
+
+    left 和 right 是 0～MAX_SPEED 的归一化前进指令。
+    当前函数不控制硬件，程序只在画面上显示计算结果。
+
+    连接实车时，在这里添加：
+    1. 发给 STM32 / Arduino 的串口指令，或者
+    2. 与电机驱动板匹配的控制代码。
+
+    具体协议、引脚、PWM 范围需要根据你的硬件确定。
+    """
+    pass
+
+
+# ============================================================
+# 3. 摄像头主程序
+# ============================================================
+
+def main():
+    # 打开摄像头。0 通常代表系统中的第一个摄像头。
+    cap = cv2.VideoCapture(CAMERA_ID)
+
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(
+                "摄像头打开失败：检查连接、系统权限以及 CAMERA_ID。"
+            )
+
+        # 创建显示窗口。
+        cv2.namedWindow("Camera")
+        cv2.namedWindow("Binary")
+
+        # 在二值图窗口中创建阈值滑块，范围为 0～255。
+        cv2.createTrackbar(
+            "Threshold",
+            "Binary",
+            INITIAL_THRESHOLD,
+            255,
+            on_threshold_change
+        )
+
+        # 创建 3×3 的结构元素，供开运算和闭运算使用。
+        # uint8 表示无符号 8 位整数，数值范围为 0～255。
+        kernel = np.ones((3, 3), dtype=np.uint8)
+
+        while True:
+            # ------------------------------------------------
+            # 第一步：读取一帧图像
+            # ------------------------------------------------
+
+            # ok：读取是否成功；frame：实际图像。
+            ok, frame = cap.read()
+
+            if not ok:
+                print("摄像头读取失败，结束程序。")
+                break
+
+            # 统一处理尺寸，使 ROI 和面积阈值有固定参考。
+            frame = cv2.resize(
+                frame,
+                (FRAME_WIDTH, FRAME_HEIGHT)
+            )
+
+            # shape 返回顺序为：高度、宽度、通道数。
+            height, width = frame.shape[:2]
+
+            # 以画面中间作为期望的轨迹位置。
+            # 如果摄像头不在车身中央，后续需要校准这个参考位置。
+            reference_x = width // 2
+
+            # ------------------------------------------------
+            # 第二步：裁剪 ROI，只观察车前方的一条道路区域
+            # ------------------------------------------------
+
+            roi_top = int(height * ROI_TOP_RATIO)
+            roi_bottom = int(height * ROI_BOTTOM_RATIO)
+
+            # 图像切片的顺序是 [y范围, x范围]，注意 y 在前。
+            # copy() 创建副本，方便后续处理和绘图互不干扰。
+            roi = frame[roi_top:roi_bottom, 0:width].copy()
+
+            # ------------------------------------------------
+            # 第三步：灰度化
+            # ------------------------------------------------
+
+            # 常规 OpenCV 彩色图像使用 BGR 通道顺序。
+            # 灰度化之后，每个像素只保留一个亮度值。
+            # 0 代表黑，255 代表白。
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+            # ------------------------------------------------
+            # 第四步：高斯滤波，减弱小噪点
+            # ------------------------------------------------
+
+            # (5, 5) 是滤波核大小；两个尺寸均为正奇数。
+            # 核过大会模糊细线，所以这里使用较小的核。
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+            # ------------------------------------------------
+            # 第五步：二值化，把候选黑线变成白色
+            # ------------------------------------------------
+
+            threshold_value = cv2.getTrackbarPos(
+                "Threshold",
+                "Binary"
+            )
+
+            # THRESH_BINARY_INV 表示反向二值化：
+            # 灰度 <= 阈值：输出 255，即白色；
+            # 灰度 >  阈值：输出 0，即黑色。
+            #
+            # 因此，真实画面里的黑线会在 binary 中显示为白色。
+            # 返回值有两个；第一个暂时不用，用 _ 接收。
+            _, binary = cv2.threshold(
+                blurred,
+                threshold_value,
+                255,
+                cv2.THRESH_BINARY_INV
+            )
+
+            # ------------------------------------------------
+            # 第六步：形态学处理
+            # ------------------------------------------------
+
+            # 开运算：先腐蚀再膨胀，去掉较小的白色噪点。
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_OPEN,
+                kernel
+            )
+
+            # 闭运算：先膨胀再腐蚀，填补小孔洞和较小间隙。
+            # 它不能修复任意长度的断线。
+            binary = cv2.morphologyEx(
+                binary,
+                cv2.MORPH_CLOSE,
+                kernel
+            )
+
+            # ------------------------------------------------
+            # 第七步：寻找白色区域的外轮廓
+            # ------------------------------------------------
+
+            # RETR_EXTERNAL：只找最外层轮廓。
+            # CHAIN_APPROX_SIMPLE：压缩轮廓点，减少冗余。
+            contours, _ = cv2.findContours(
+                binary,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            # 找到面积足够大、且面积最大的轮廓。
+            # 初学版假设：ROI 中最大的深色区域就是轨迹。
+            target = None
+            largest_area = 0.0
+
+            for contour in contours:
+                area = cv2.contourArea(contour)
+
+                if area >= MIN_CONTOUR_AREA and area > largest_area:
+                    target = contour
+                    largest_area = area
+
+            # 每帧先设为停车，只有本帧检测有效才更新控制值。
+            # 这样丢线时不会继续沿用上一帧的前进指令。
+            left_speed = 0.0
+            right_speed = 0.0
+            error = None
+            status = "LINE LOST"
+
+            # ------------------------------------------------
+            # 第八步：用图像矩求轨迹区域的质心
+            # ------------------------------------------------
+
+            if target is not None:
+                moments = cv2.moments(target)
+
+                # m00 为零时不能做除法，必须先判断。
+                if moments["m00"] > 0:
+                    center_x = moments["m10"] / moments["m00"]
+                    center_y = moments["m01"] / moments["m00"]
+
+                    # ROI 覆盖整幅图像的宽度，因此 x 不需要偏移。
+                    # y 是 ROI 内坐标，放回原图时必须加 roi_top。
+                    draw_x = int(round(center_x))
+                    draw_y = int(round(center_y)) + roi_top
+
+                    # ----------------------------------------
+                    # 第九步：计算归一化横向偏差
+                    # ----------------------------------------
+
+                    # error < 0：线在左侧。
+                    # error > 0：线在右侧。
+                    # error 接近 0：线接近期望位置。
+                    error = (center_x - reference_x) / (width / 2)
+
+                    # ----------------------------------------
+                    # 第十步：比例控制，计算左右轮指令
+                    # ----------------------------------------
+
+                    correction = KP * error
+
+                    # 假设画面方向与车身方向一致，且没有左右镜像。
+                    #
+                    # 线在右侧时：error 为正，
+                    # 左轮更快、右轮更慢，小车向右转。
+                    #
+                    # 线在左侧时则相反。
+                    left_speed = BASE_SPEED + correction
+                    right_speed = BASE_SPEED - correction
+
+                    # 入门版只允许前进或停止，不让车轮反转。
+                    left_speed = limit(left_speed, 0.0, MAX_SPEED)
+                    right_speed = limit(right_speed, 0.0, MAX_SPEED)
+
+                    status = "TRACKING"
+
+                    # ----------------------------------------
+                    # 第十一步：画出检测结果，便于观察
+                    # ----------------------------------------
+
+                    # 外接矩形的位置也是 ROI 内坐标。
+                    x, y, box_width, box_height = cv2.boundingRect(target)
+
+                    cv2.rectangle(
+                        frame,
+                        (x, y + roi_top),
+                        (x + box_width - 1, y + roi_top + box_height - 1),
+                        (0, 255, 0),    # BGR：绿色
+                        2
+                    )
+
+                    cv2.circle(
+                        frame,
+                        (draw_x, draw_y),
+                        6,
+                        (0, 0, 255),    # BGR：红色
+                        -1             # -1 表示填充圆
+                    )
+
+                    # 黄色横线表示轨迹中心与参考中心之间的偏差。
+                    cv2.line(
+                        frame,
+                        (reference_x, draw_y),
+                        (draw_x, draw_y),
+                        (0, 255, 255),
+                        2
+                    )
+
+            # 把本帧控制值交给电机接口。
+            # 当前接口为空，因此只计算、不实际驱动电机。
+            set_motor_command(left_speed, right_speed)
+
+            # 画蓝色 ROI 框。
+            cv2.rectangle(
+                frame,
+                (0, roi_top),
+                (width - 1, roi_bottom - 1),
+                (255, 0, 0),
+                2
+            )
+
+            # 画画面中心参考线。
+            cv2.line(
+                frame,
+                (reference_x, roi_top),
+                (reference_x, roi_bottom - 1),
+                (255, 255, 0),
+                2
+            )
+
+            error_text = "--" if error is None else f"{error:+.3f}"
+
+            # OpenCV 默认字体不支持直接绘制中文，
+            # 所以窗口中使用英文，代码注释使用中文。
+            cv2.putText(
+                frame,
+                f"{status}  Error: {error_text}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0) if error is not None else (0, 0, 255),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"L: {left_speed:.2f}  R: {right_speed:.2f}",
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2
+            )
+
+            cv2.imshow("Camera", frame)
+            cv2.imshow("Binary", binary)
+
+            # waitKey 负责处理窗口事件，同时读取键盘。
+            # 点击图像窗口后，按 q 或 Esc 退出。
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q") or key == 27:
+                break
+
+    finally:
+        # 无论正常退出、读取失败还是按 Ctrl+C，都尝试发送停止指令。
+        try:
+            set_motor_command(0.0, 0.0)
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+
+
+# 直接运行此文件时，从 main() 开始执行。
+if __name__ == "__main__":
+    main()
