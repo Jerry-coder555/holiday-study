@@ -1,4 +1,4 @@
-# holiday-study（分支)
+# holiday-study from master branch
 Git学习打卡仓库
 Day1：基础代码
 Day2：Git版本管理练习
