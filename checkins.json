@@ -1,0 +1,26 @@
+[
+  {
+    "date": "2026-09-21",
+    "content": "learn python",
+    "duration": 1.0,
+    "note": ""
+  },
+  {
+    "date": "2026-09-21",
+    "content": "学习高数",
+    "duration": 3.0,
+    "note": ""
+  },
+  {
+    "date": "2026-09-21",
+    "content": "学习",
+    "duration": 5.0,
+    "note": ""
+  },
+  {
+    "date": "2026-09-22",
+    "content": "背单词",
+    "duration": 2.0,
+    "note": ""
+  }
+]
